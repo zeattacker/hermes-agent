@@ -577,15 +577,103 @@ def _build_job_prompt(job: dict) -> str:
     return "\n".join(parts)
 
 
+def _is_script_only(job: dict) -> bool:
+    """Decide whether a job should deliver raw script stdout and skip the LLM.
+
+    Priority order:
+      1. Per-job ``script_only: true`` in the job dict (jobs.json).
+      2. Global ``cron.script_only: true`` in config.yaml.
+
+    Returns False if the job has no ``script`` configured — script-only
+    mode is meaningless without a script.
+    """
+    if not job.get("script"):
+        return False
+    if bool(job.get("script_only")):
+        return True
+    try:
+        user_cfg = load_config()
+        return bool(user_cfg.get("cron", {}).get("script_only", False))
+    except Exception:
+        return False
+
+
+def _run_job_script_only(job: dict) -> tuple[bool, str, str, Optional[str]]:
+    """Run a cron job in script-only mode: deliver script stdout verbatim.
+
+    Skips every LLM step — no agent prompt, no re-generation, no drift. The
+    script is the source of truth. Useful when the pre-computed content
+    (e.g. morning_brief skill) is already the final form and we need
+    byte-for-byte delivery.
+
+    Returns the same 4-tuple shape as ``run_job``:
+        (success, full_output_doc, final_response, error_message)
+    """
+    job_id = job["id"]
+    job_name = job["name"]
+    script_path = job.get("script")
+    assert script_path, "_run_job_script_only requires job['script']"
+
+    logger.info("Running job '%s' (ID: %s) in script-only mode", job_name, job_id)
+
+    try:
+        success, script_output = _run_job_script(script_path)
+    except Exception as exc:  # defensive — _run_job_script already swallows
+        error_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("Job '%s' script failed: %s", job_name, error_msg)
+        output_doc = (
+            f"# Cron Job: {job_name} (FAILED)\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Mode:** script-only\n\n"
+            f"## Error\n\n{error_msg}\n"
+        )
+        return False, output_doc, "", error_msg
+
+    run_ts = _hermes_now().strftime('%Y-%m-%d %H:%M:%S')
+    if not success:
+        output_doc = (
+            f"# Cron Job: {job_name} (FAILED)\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {run_ts}\n"
+            f"**Mode:** script-only\n\n"
+            f"## Script Error\n\n```\n{script_output}\n```\n"
+        )
+        return False, output_doc, "", "script exited non-zero"
+
+    # Success — honor [SILENT] marker exactly like the LLM path would.
+    final_response = (script_output or "").strip()
+    if SILENT_MARKER in final_response.upper():
+        final_response = final_response  # keep as-is; caller checks SILENT
+    output_doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {run_ts}\n"
+        f"**Schedule:** {job.get('schedule_display', 'N/A')}\n"
+        f"**Mode:** script-only (LLM bypassed for fidelity)\n\n"
+        f"## Script Output\n\n"
+        f"{script_output}\n"
+    )
+    logger.info("Job '%s' completed (script-only)", job_name)
+    return True, output_doc, final_response, None
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
-    
+
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
+    # Script-only fast path: deliver pre-computed script stdout verbatim,
+    # skip the LLM agent. Useful when the script (e.g. morning_brief) is
+    # already the final form and LLM re-generation risks content drift
+    # (outer code fences, date mutations, re-summarisation).
+    if _is_script_only(job):
+        return _run_job_script_only(job)
+
     from run_agent import AIAgent
-    
+
     # Initialize SQLite session store so cron job messages are persisted
     # and discoverable via session_search (same pattern as gateway/run.py).
     _session_db = None
@@ -594,7 +682,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         _session_db = SessionDB()
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
-    
+
     job_id = job["id"]
     job_name = job["name"]
     prompt = _build_job_prompt(job)

@@ -1367,3 +1367,127 @@ class TestSendMediaViaAdapter:
         self._run_with_loop(adapter, "123", media_files, None, {"id": "j4"})
         adapter.send_voice.assert_called_once()
         adapter.send_image_file.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Script-only mode — bypass LLM, deliver script stdout verbatim.
+# ---------------------------------------------------------------------------
+
+
+class TestIsScriptOnly:
+    def test_returns_false_when_no_script(self):
+        from cron.scheduler import _is_script_only
+        assert _is_script_only({"id": "j1"}) is False
+        assert _is_script_only({"id": "j1", "script_only": True}) is False
+
+    def test_per_job_flag_takes_precedence(self):
+        from cron.scheduler import _is_script_only
+        job = {"id": "j1", "script": "foo.py", "script_only": True}
+        with patch("cron.scheduler.load_config", return_value={"cron": {"script_only": False}}):
+            assert _is_script_only(job) is True
+
+    def test_global_flag_applies_when_per_job_unset(self):
+        from cron.scheduler import _is_script_only
+        job = {"id": "j1", "script": "foo.py"}
+        with patch("cron.scheduler.load_config", return_value={"cron": {"script_only": True}}):
+            assert _is_script_only(job) is True
+
+    def test_default_off(self):
+        from cron.scheduler import _is_script_only
+        job = {"id": "j1", "script": "foo.py"}
+        with patch("cron.scheduler.load_config", return_value={}):
+            assert _is_script_only(job) is False
+
+    def test_config_load_exception_treated_as_off(self):
+        from cron.scheduler import _is_script_only
+        job = {"id": "j1", "script": "foo.py"}
+        with patch("cron.scheduler.load_config", side_effect=RuntimeError("boom")):
+            assert _is_script_only(job) is False
+
+
+class TestRunJobScriptOnly:
+    def test_success_returns_stdout_as_final_response(self):
+        """Script stdout must be delivered byte-for-byte as ``final_response``
+        so no LLM can rewrap or mutate it (the whole point of script-only)."""
+        from cron.scheduler import _run_job_script_only
+        job = {
+            "id": "j1",
+            "name": "test-job",
+            "script": "stub.py",
+            "schedule_display": "every 1h",
+        }
+        stdout = "# Morning Brief\n_Generated 2026-04-17 07:00 WIB_\n\n## Yesterday\n- item"
+        with patch("cron.scheduler._run_job_script", return_value=(True, stdout)):
+            success, output_doc, final_response, error = _run_job_script_only(job)
+
+        assert success is True
+        assert error is None
+        # Final response = exact script stdout, no LLM mutation.
+        assert final_response == stdout
+        # Output doc (saved to disk) mentions the mode for debuggability.
+        assert "script-only" in output_doc
+        assert stdout in output_doc
+
+    def test_script_failure_returns_error(self):
+        from cron.scheduler import _run_job_script_only
+        job = {"id": "j2", "name": "fail-job", "script": "broken.py"}
+        with patch("cron.scheduler._run_job_script", return_value=(False, "exit 2\nstderr: boom")):
+            success, output_doc, final_response, error = _run_job_script_only(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error and "script" in error.lower()
+        assert "FAILED" in output_doc
+        assert "boom" in output_doc
+
+    def test_silent_marker_passes_through_to_caller(self):
+        """If the script prints [SILENT], ``final_response`` contains the
+        marker so tick()'s delivery check can suppress it (same as LLM path)."""
+        from cron.scheduler import _run_job_script_only, SILENT_MARKER
+        job = {"id": "j3", "name": "silent", "script": "quiet.py"}
+        with patch("cron.scheduler._run_job_script", return_value=(True, "[SILENT]")):
+            success, _, final_response, error = _run_job_script_only(job)
+        assert success is True
+        assert error is None
+        assert SILENT_MARKER in final_response.upper()
+
+    def test_empty_stdout_returns_empty_final_response(self):
+        from cron.scheduler import _run_job_script_only
+        job = {"id": "j4", "name": "empty", "script": "noop.py"}
+        with patch("cron.scheduler._run_job_script", return_value=(True, "")):
+            success, _, final_response, error = _run_job_script_only(job)
+        assert success is True
+        assert final_response == ""
+
+
+class TestRunJobDispatchesToScriptOnly:
+    """Integration check: run_job must short-circuit to the script-only
+    path when the flag is set, skipping the AIAgent import entirely."""
+
+    def test_run_job_routes_to_script_only_when_flag_set(self):
+        from cron.scheduler import run_job
+        job = {
+            "id": "j5",
+            "name": "brief",
+            "script": "brief.py",
+            "script_only": True,
+        }
+        with patch("cron.scheduler._run_job_script_only",
+                   return_value=(True, "DOC", "RESP", None)) as fake:
+            result = run_job(job)
+        fake.assert_called_once_with(job)
+        assert result == (True, "DOC", "RESP", None)
+
+    def test_run_job_does_not_route_when_flag_absent(self):
+        """Without script_only, run_job must NOT invoke the fast path. What
+        the LLM path actually does (succeed, auth-fail, timeout) is outside
+        the scope of this unit — only the routing decision matters."""
+        from cron.scheduler import run_job
+        with patch("cron.scheduler._run_job_script_only") as bypass, \
+             patch("cron.scheduler.load_config", return_value={}):
+            try:
+                run_job({"id": "j6", "name": "n", "script": "s.py"})
+            except Exception:
+                # LLM path may raise (missing auth, invalid model) — fine.
+                pass
+        bypass.assert_not_called()
