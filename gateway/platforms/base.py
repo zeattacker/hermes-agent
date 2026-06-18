@@ -5900,6 +5900,18 @@ class BasePlatformAdapter(ABC):
                 # with an unknown extension is intentionally left in the body for
                 # extract_local_files below to pick up rather than silently dropped (#34517).
                 text_content = _strip_media_directives(text_content).strip()
+
+                # ZEXUS: extract personal-finance confirmation marker
+                # ``[pf_confirm:<tx_id>]``. When present, the response is
+                # delivered as an interactive button prompt (Ya / Batal)
+                # instead of plain text, IF the adapter implements
+                # ``send_tx_confirm``. Falls back to text otherwise.
+                _pf_confirm_tx_id = None
+                _pf_match = re.search(r"\[pf_confirm:(\d+)\]", text_content)
+                if _pf_match:
+                    _pf_confirm_tx_id = int(_pf_match.group(1))
+                    text_content = re.sub(r"\[pf_confirm:\d+\]", "", text_content).strip()
+
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
@@ -6039,81 +6051,117 @@ class BasePlatformAdapter(ABC):
                 # the current transport before sending it.
                 if text_content and not _tts_caption_delivered:
                     delivery_adapter = self._final_delivery_adapter(event.source)
-                    logger.info(
-                        "[%s] Sending response (%d chars) to %s",
-                        delivery_adapter.name,
-                        len(text_content),
-                        event.source.chat_id,
-                    )
                     _reply_anchor = _reply_anchor_for_event(event)
-                    # Delivery-obligation ledger: durably record the final
-                    # response BEFORE the send attempt so a gateway crash
-                    # between finalize and platform ACK can redeliver it on
-                    # the next boot instead of silently losing the turn's
-                    # output (#58818). Best-effort at every step — ledger
-                    # trouble must never block or delay the actual send.
-                    # Slash-command and ephemeral replies are cheap to
-                    # regenerate and are not recorded.
-                    _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
-                        try:
-                            from gateway.delivery_ledger import (
-                                compute_obligation_id,
-                                ledger_enabled,
-                                mark_attempting,
-                                record_obligation,
+                    # ZEXUS: route to interactive button confirmation when the
+                    # response carries a ``[pf_confirm:<tx_id>]`` marker AND the
+                    # delivery adapter supports send_tx_confirm. Otherwise send
+                    # as text.
+                    #
+                    # Re-anchored onto upstream's delivery-obligation ledger
+                    # (#58818). The button path deliberately stays OUT of the
+                    # ledger: a tx confirmation is a live interactive prompt,
+                    # so redelivering it after a crash could re-prompt for a
+                    # transaction the user already verified or rejected. That
+                    # is the same reasoning upstream uses to exclude slash and
+                    # ephemeral replies below.
+                    if _pf_confirm_tx_id is not None and hasattr(
+                        delivery_adapter, "send_tx_confirm"
+                    ):
+                        logger.info(
+                            "[%s] Sending tx confirm buttons (tx=%d, %d chars) to %s",
+                            delivery_adapter.name,
+                            _pf_confirm_tx_id,
+                            len(text_content),
+                            event.source.chat_id,
+                        )
+                        result = await delivery_adapter.send_tx_confirm(
+                            chat_id=event.source.chat_id,
+                            prompt=text_content,
+                            tx_id=_pf_confirm_tx_id,
+                            metadata=_final_thread_metadata,
+                        )
+                        _record_delivery(result)
+                    else:
+                        if _pf_confirm_tx_id is not None:
+                            logger.info(
+                                "[%s] pf_confirm marker present but adapter has no "
+                                "button support — falling back to text",
+                                delivery_adapter.name,
                             )
-
-                            if await asyncio.to_thread(ledger_enabled):
-                                _obligation_id = compute_obligation_id(
-                                    session_key,
-                                    str(getattr(event, "message_id", "") or ""),
-                                    text_content,
-                                )
-                                await asyncio.to_thread(
+                        logger.info(
+                            "[%s] Sending response (%d chars) to %s",
+                            delivery_adapter.name,
+                            len(text_content),
+                            event.source.chat_id,
+                        )
+                        # Delivery-obligation ledger: durably record the final
+                        # response BEFORE the send attempt so a gateway crash
+                        # between finalize and platform ACK can redeliver it on
+                        # the next boot instead of silently losing the turn's
+                        # output (#58818). Best-effort at every step — ledger
+                        # trouble must never block or delay the actual send.
+                        # Slash-command and ephemeral replies are cheap to
+                        # regenerate and are not recorded.
+                        _obligation_id = None
+                        if not is_ephemeral_response and not str(
+                            event.text or ""
+                        ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                            try:
+                                from gateway.delivery_ledger import (
+                                    compute_obligation_id,
+                                    ledger_enabled,
+                                    mark_attempting,
                                     record_obligation,
-                                    obligation_id=_obligation_id,
-                                    session_key=session_key,
-                                    platform=str(
-                                        getattr(event.source.platform, "value",
-                                                event.source.platform)
-                                    ),
-                                    chat_id=event.source.chat_id,
-                                    thread_id=getattr(event.source, "thread_id", None),
-                                    content=text_content,
                                 )
-                                await asyncio.to_thread(mark_attempting, _obligation_id)
-                        except Exception:
-                            logger.debug("delivery ledger record failed", exc_info=True)
-                            _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
-                    _record_delivery(result)
-                    if _obligation_id is not None:
-                        try:
-                            from gateway.delivery_ledger import (
-                                mark_delivered,
-                                mark_failed,
-                            )
 
-                            if getattr(result, "success", False):
-                                await asyncio.to_thread(mark_delivered, _obligation_id)
-                            else:
-                                await asyncio.to_thread(
+                                if await asyncio.to_thread(ledger_enabled):
+                                    _obligation_id = compute_obligation_id(
+                                        session_key,
+                                        str(getattr(event, "message_id", "") or ""),
+                                        text_content,
+                                    )
+                                    await asyncio.to_thread(
+                                        record_obligation,
+                                        obligation_id=_obligation_id,
+                                        session_key=session_key,
+                                        platform=str(
+                                            getattr(event.source.platform, "value",
+                                                    event.source.platform)
+                                        ),
+                                        chat_id=event.source.chat_id,
+                                        thread_id=getattr(event.source, "thread_id", None),
+                                        content=text_content,
+                                    )
+                                    await asyncio.to_thread(mark_attempting, _obligation_id)
+                            except Exception:
+                                logger.debug("delivery ledger record failed", exc_info=True)
+                                _obligation_id = None
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
+                        _record_delivery(result)
+                        if _obligation_id is not None:
+                            try:
+                                from gateway.delivery_ledger import (
+                                    mark_delivered,
                                     mark_failed,
-                                    _obligation_id,
-                                    str(getattr(result, "error", "") or ""),
                                 )
-                        except Exception:
-                            logger.debug(
-                                "delivery ledger update failed", exc_info=True
-                            )
+
+                                if getattr(result, "success", False):
+                                    await asyncio.to_thread(mark_delivered, _obligation_id)
+                                else:
+                                    await asyncio.to_thread(
+                                        mark_failed,
+                                        _obligation_id,
+                                        str(getattr(result, "error", "") or ""),
+                                    )
+                            except Exception:
+                                logger.debug(
+                                    "delivery ledger update failed", exc_info=True
+                                )
 
                     # Schedule auto-deletion on the adapter that owns the new
                     # message ID, which may be the reconnect replacement.

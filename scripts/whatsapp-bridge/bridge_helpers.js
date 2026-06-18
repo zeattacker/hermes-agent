@@ -349,7 +349,27 @@ export async function extractBridgeEvent({
     }
   };
 
-  if (messageContent.conversation) {
+  // ZEXUS: a button tap (native Baileys buttonsResponseMessage and the two
+  // newer template/interactive shapes) is surfaced as an ordinary inbound text
+  // whose body is the selectedButtonId. The gateway then detects e.g.
+  // "pf_confirm:5" and dispatches to the pf CLI with no LLM round-trip.
+  // Must stay ahead of the conversation/extendedText branches: some clients
+  // populate both, and the button id is the authoritative payload.
+  if (messageContent.buttonsResponseMessage?.selectedButtonId) {
+    body = messageContent.buttonsResponseMessage.selectedButtonId;
+    nativeType = 'buttonsResponseMessage';
+  } else if (messageContent.templateButtonReplyMessage?.selectedId) {
+    body = messageContent.templateButtonReplyMessage.selectedId;
+    nativeType = 'templateButtonReplyMessage';
+  } else if (messageContent.interactiveResponseMessage) {
+    try {
+      const params = JSON.parse(
+        messageContent.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}'
+      );
+      if (params.id) body = params.id;
+    } catch {}
+    nativeType = 'interactiveResponseMessage';
+  } else if (messageContent.conversation) {
     body = messageContent.conversation;
     nativeType = 'conversation';
   } else if (messageContent.extendedTextMessage?.text) {

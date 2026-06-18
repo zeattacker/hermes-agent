@@ -1015,6 +1015,39 @@ app.post('/send-poll', async (req, res) => {
   }
 });
 
+// ZEXUS: send a text + native buttons message (transaction confirmation).
+// Button taps come back through extractBridgeEvent as an inbound text whose
+// body is the button id, so no extra inbound plumbing is needed here.
+app.post('/send-buttons', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, text, footer, buttons } = req.body;
+  if (!chatId || !text || !Array.isArray(buttons) || buttons.length === 0) {
+    return res.status(400).json({ error: 'chatId, text, and a non-empty buttons array are required' });
+  }
+
+  try {
+    const payload = {
+      text,
+      footer: footer || '',
+      buttons: buttons.map((b, i) => ({
+        buttonId: String(b.id ?? `btn_${i}`),
+        buttonText: { displayText: String(b.label ?? b.id ?? `Option ${i + 1}`) },
+        type: 1,
+      })),
+      headerType: 1,
+    };
+    const sent = await sendWithTimeout(chatId, payload);
+    trackSentMessageId(sent);
+    rememberSentMessage(sent, payload);
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // Send native WhatsApp location pin
 app.post('/send-location', async (req, res) => {
   if (!sock || connectionState !== 'connected') {

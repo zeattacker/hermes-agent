@@ -1109,6 +1109,61 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    async def send_tx_confirm(
+        self,
+        chat_id: str,
+        prompt: str,
+        tx_id: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """ZEXUS: send a native WhatsApp button confirmation for a pending tx.
+
+        Renders 2 buttons: ✅ Ya (callback id ``pf_confirm:<tx_id>``) and
+        ❌ Batal (callback id ``pf_reject:<tx_id>``). When the recipient taps
+        a button, WhatsApp sends back a ``buttonsResponseMessage`` whose
+        ``selectedButtonId`` becomes the inbound message body — the gateway
+        intercepts ``pf_confirm:N`` / ``pf_reject:N`` and dispatches to the
+        ``pf`` CLI directly (no LLM round-trip).
+
+        Caveat: Meta sometimes strips buttons for unverified bot accounts. In
+        that case the recipient sees only the text + footer and must reply
+        manually with "ya"/"batal".
+        """
+        if not self._running or not self._http_session:
+            return SendResult(success=False, error="Not connected")
+        bridge_exit = await self._check_managed_bridge_exit()
+        if bridge_exit:
+            return SendResult(success=False, error=bridge_exit)
+        try:
+            import aiohttp
+
+            formatted = self.format_message(prompt)
+            payload: Dict[str, Any] = {
+                "chatId": to_whatsapp_jid(chat_id),
+                "text": formatted,
+                "footer": f"Konfirmasi tx #{tx_id} — atau ketik 'ya'/'batal'",
+                "buttons": [
+                    {"id": f"pf_confirm:{tx_id}", "label": "✅ Ya"},
+                    {"id": f"pf_reject:{tx_id}", "label": "❌ Batal"},
+                ],
+            }
+            async with self._http_session.post(
+                f"http://127.0.0.1:{self._bridge_port}/send-buttons",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return SendResult(
+                        success=True,
+                        message_id=data.get("messageId"),
+                        raw_response=data,
+                    )
+                error = await resp.text()
+                return SendResult(success=False, error=error)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
     async def send_clarify(
         self,
         chat_id: str,

@@ -14388,6 +14388,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        # ZEXUS: intercept personal-finance button-click replies of the form
+        # ``pf_confirm:<id>`` or ``pf_reject:<id>``. The WhatsApp bridge
+        # surfaces a button tap as a normal inbound message whose body is the
+        # selectedButtonId; Discord handles its own buttons in TxConfirmView,
+        # so this path is primarily for WhatsApp (and any platform that routes
+        # button taps back as plain text). We run the ``pf`` CLI directly
+        # (verify/reject) and reply with a formatted result — no agent LLM
+        # round-trip needed for confirmation taps.
+        _btn_text = (event.text or "").strip()
+        _btn_match = re.match(r"^pf_(confirm|reject):(\d+)$", _btn_text)
+        if _btn_match:
+            _action = _btn_match.group(1)
+            _tx_id = int(_btn_match.group(2))
+            _adapter = self.adapters.get(source.platform)
+            if _adapter:
+                try:
+                    import subprocess
+                    _pf_args = ["/home/nvidia/.local/bin/pf", "tx"]
+                    if _action == "confirm":
+                        _pf_args += ["verify", str(_tx_id)]
+                    else:
+                        _pf_args += [
+                            "reject", str(_tx_id),
+                            "--reason",
+                            f"user batal via button ({source.user_name or source.user_id})",
+                        ]
+                    _r = subprocess.run(_pf_args, capture_output=True, text=True, timeout=10)
+                    _payload = json.loads(_r.stdout) if _r.stdout else {"ok": False, "error": _r.stderr[:200]}
+                except Exception as _e:
+                    _payload = {"ok": False, "error": f"{type(_e).__name__}: {_e}"}
+
+                if _action == "confirm" and _payload.get("ok"):
+                    _bal = _payload.get("balances") or {}
+                    if _bal:
+                        _f = _bal["from"]
+                        _t = _bal["to"]
+                        _amt = _f["previous"] - _f["new"]
+                        _reply = (
+                            f"✓ Transfer Rp {_amt:,.0f} berhasil.\n"
+                            f"• {_f['name']}: Rp {_f['previous']:,.0f} → Rp {_f['new']:,.0f}\n"
+                            f"• {_t['name']}: Rp {_t['previous']:,.0f} → Rp {_t['new']:,.0f}"
+                        )
+                    else:
+                        _reply = f"✓ Transaksi #{_tx_id} verified."
+                elif _action == "reject" and _payload.get("ok"):
+                    _reply = f"✗ Transaksi #{_tx_id} dibatalkan."
+                else:
+                    _reply = f"⚠️ {_payload.get('error', 'unknown error')}"
+
+                try:
+                    await _adapter.send(source.chat_id, _reply)
+                except Exception as _se:
+                    logger.warning("Failed to send pf button reply: %s", _se)
+                logger.info(
+                    "pf button: tx=%s action=%s ok=%s platform=%s",
+                    _tx_id, _action, _payload.get("ok"),
+                    source.platform.value if source.platform else "?",
+                )
+            return None
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
