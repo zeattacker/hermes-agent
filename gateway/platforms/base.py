@@ -1720,6 +1720,16 @@ class BasePlatformAdapter(ABC):
                 # Strip any remaining internal directives from message body (fixes #1561)
                 text_content = text_content.replace("[[audio_as_voice]]", "").strip()
                 text_content = re.sub(r"MEDIA:\s*\S+", "", text_content).strip()
+
+                # Extract personal-finance confirmation marker `[pf_confirm:<tx_id>]`
+                # When present, the response will be delivered as an interactive
+                # button prompt (Ya / Batal) instead of plain text, IF the adapter
+                # supports send_tx_confirm. Falls back to text otherwise.
+                _pf_confirm_tx_id = None
+                _pf_match = re.search(r"\[pf_confirm:(\d+)\]", text_content)
+                if _pf_match:
+                    _pf_confirm_tx_id = int(_pf_match.group(1))
+                    text_content = re.sub(r"\[pf_confirm:\d+\]", "", text_content).strip()
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
@@ -1767,14 +1777,35 @@ class BasePlatformAdapter(ABC):
 
                 # Send the text portion
                 if text_content:
-                    logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
-                    result = await self._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=event.message_id,
-                        metadata=_thread_metadata,
-                    )
-                    _record_delivery(result)
+                    # Route to interactive button confirmation if the response
+                    # carries a [pf_confirm:<tx_id>] marker AND the adapter
+                    # supports send_tx_confirm. Otherwise send as plain text.
+                    if _pf_confirm_tx_id is not None and hasattr(self, "send_tx_confirm"):
+                        logger.info(
+                            "[%s] Sending tx confirm buttons (tx=%d, %d chars) to %s",
+                            self.name, _pf_confirm_tx_id, len(text_content), event.source.chat_id,
+                        )
+                        result = await self.send_tx_confirm(
+                            chat_id=event.source.chat_id,
+                            prompt=text_content,
+                            tx_id=_pf_confirm_tx_id,
+                            metadata=_thread_metadata,
+                        )
+                        _record_delivery(result)
+                    else:
+                        if _pf_confirm_tx_id is not None:
+                            logger.info(
+                                "[%s] pf_confirm marker present but adapter has no button support — falling back to text",
+                                self.name,
+                            )
+                        logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
+                        result = await self._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=event.message_id,
+                            metadata=_thread_metadata,
+                        )
+                        _record_delivery(result)
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()

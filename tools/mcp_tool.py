@@ -1399,11 +1399,24 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 }, ensure_ascii=False)
 
-            # Collect text from content blocks
+            # Collect text from content blocks.
+            # ZEXUS-PATCH-3: handle EmbeddedResource (type="resource") in addition
+            # to TextContent. QMD + other spec-compliant MCP servers return resource
+            # blocks where the payload sits at block.resource.text, not block.text.
+            # Without this branch, tools/call returns an empty string to the agent.
             parts: List[str] = []
             for block in (result.content or []):
                 if hasattr(block, "text"):
                     parts.append(block.text)
+                elif getattr(block, "type", None) == "resource":
+                    resource = getattr(block, "resource", None)
+                    if resource is not None:
+                        if hasattr(resource, "text"):
+                            parts.append(resource.text)
+                        elif hasattr(resource, "blob"):
+                            uri = getattr(resource, "uri", "<unknown>")
+                            mime = getattr(resource, "mimeType", "application/octet-stream")
+                            parts.append(f"[binary resource: {uri} ({mime})]")
             text_result = "\n".join(parts) if parts else ""
 
             # Combine content + structuredContent when both are present.

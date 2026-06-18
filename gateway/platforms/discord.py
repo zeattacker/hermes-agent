@@ -1875,7 +1875,17 @@ class DiscordAdapter(BasePlatformAdapter):
         # Register skills under a single /skill command group with category
         # subcommand groups.  This uses 1 top-level slot instead of N,
         # supporting up to 25 categories × 25 skills = 625 skills.
-        self._register_skill_group(tree)
+        #
+        # Discord enforces an 8000-char total size per top-level command tree.
+        # When many skills are installed the /skill group exceeds this and the
+        # whole tree.sync() call fails, which blocks all other slash commands
+        # from appearing.  Set DISCORD_DISABLE_SKILL_SLASH=true (per-profile
+        # .env) to skip skill registration — non-skill slash commands still
+        # work, and `/<skill-name>` inline invocation in chat still works.
+        if os.getenv("DISCORD_DISABLE_SKILL_SLASH", "false").lower() in ("true", "1", "yes"):
+            logger.info("[%s] /skill slash group disabled via DISCORD_DISABLE_SKILL_SLASH", self.name)
+        else:
+            self._register_skill_group(tree)
 
     def _register_skill_group(self, tree) -> None:
         """Register a ``/skill`` command group with category subcommand groups.
@@ -1897,6 +1907,27 @@ class DiscordAdapter(BasePlatformAdapter):
             categories, uncategorized, hidden = discord_skill_commands_by_category(
                 reserved_names=existing_names,
             )
+
+            # Optional allowlist: DISCORD_SKILL_ALLOWLIST is a comma-separated
+            # list of cmd_keys (with or without leading slash) to register as
+            # slash commands. When set, all other skills are dropped. Skills
+            # remain invokable from chat either way; this only scopes the
+            # Discord slash-command surface to keep under the 8000-char limit.
+            allowlist_raw = os.getenv("DISCORD_SKILL_ALLOWLIST", "").strip()
+            if allowlist_raw:
+                allow = {s.strip().lstrip("/") for s in allowlist_raw.split(",") if s.strip()}
+                before = sum(len(v) for v in categories.values()) + len(uncategorized)
+                categories = {
+                    cat: [(n, d, k) for (n, d, k) in items if k.lstrip("/") in allow]
+                    for cat, items in categories.items()
+                }
+                categories = {k: v for k, v in categories.items() if v}
+                uncategorized = [(n, d, k) for (n, d, k) in uncategorized if k.lstrip("/") in allow]
+                after = sum(len(v) for v in categories.values()) + len(uncategorized)
+                logger.info(
+                    "[%s] DISCORD_SKILL_ALLOWLIST filtered /skill group: %d -> %d skill(s)",
+                    self.name, before, after,
+                )
 
             if not categories and not uncategorized:
                 return
@@ -2298,6 +2329,41 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             view = UpdatePromptView(
                 session_key=session_key,
+                allowed_user_ids=self._allowed_user_ids,
+            )
+            msg = await channel.send(embed=embed, view=view)
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def send_tx_confirm(
+        self, chat_id: str, prompt: str, tx_id: int,
+        metadata: Optional[dict] = None,
+    ) -> SendResult:
+        """Send a button-based tx confirmation prompt (Ya / Batal).
+
+        On button click, the bound view runs ``pf tx verify <id>`` or
+        ``pf tx reject <id>`` via subprocess and edits the message with
+        the formatted result. Used by the personal-finance skill.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        try:
+            target_id = chat_id
+            if metadata and metadata.get("thread_id"):
+                target_id = metadata["thread_id"]
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+
+            embed = discord.Embed(
+                title="💰 Konfirmasi Transaksi",
+                description=prompt,
+                color=discord.Color.blue(),
+            )
+            embed.set_footer(text=f"tx #{tx_id} — klik Ya untuk verify, Batal untuk reject")
+            view = TxConfirmView(
+                tx_id=tx_id,
                 allowed_user_ids=self._allowed_user_ids,
             )
             msg = await channel.send(embed=embed, view=view)
@@ -2943,6 +3009,125 @@ if DISCORD_AVAILABLE:
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
             await self._respond(interaction, "n", discord.Color.red(), "No")
+
+        async def on_timeout(self):
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+
+    class TxConfirmView(discord.ui.View):
+        """Interactive Ya/Batal buttons for personal-finance tx confirmation.
+
+        On click, runs ``pf tx verify`` or ``pf tx reject`` via subprocess and
+        edits the message to show the formatted result + disabled buttons.
+        Only authorized users can click. Times out after 30 minutes.
+        """
+
+        def __init__(self, tx_id: int, allowed_user_ids: set):
+            super().__init__(timeout=1800)
+            self.tx_id = tx_id
+            self.allowed_user_ids = allowed_user_ids
+            self.resolved = False
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            if not self.allowed_user_ids:
+                return True
+            return str(interaction.user.id) in self.allowed_user_ids
+
+        def _format_verify_result(self, payload: dict) -> tuple[str, discord.Color]:
+            """Convert `pf tx verify` JSON to a friendly message + color."""
+            if not payload.get("ok"):
+                return (f"⚠️ {payload.get('error', 'unknown error')}", discord.Color.red())
+            bal = payload.get("balances") or {}
+            if bal:
+                f = bal["from"]; t = bal["to"]
+                amount = f["previous"] - f["new"]
+                return (
+                    f"✓ Transfer Rp {amount:,.0f} berhasil.\n"
+                    f"• **{f['name']}**: Rp {f['previous']:,.0f} → Rp {f['new']:,.0f}\n"
+                    f"• **{t['name']}**: Rp {t['previous']:,.0f} → Rp {t['new']:,.0f}",
+                    discord.Color.green(),
+                )
+            return (f"✓ Transaksi #{self.tx_id} verified.", discord.Color.green())
+
+        def _run_pf(self, *args) -> dict:
+            """Invoke `pf` CLI and parse JSON output."""
+            import json as _json
+            import subprocess
+            try:
+                r = subprocess.run(
+                    ["/home/nvidia/.local/bin/pf", *args],
+                    capture_output=True, text=True, timeout=10,
+                )
+                # pf always prints JSON to stdout, even on error (exit code != 0)
+                if r.stdout:
+                    return _json.loads(r.stdout)
+                return {"ok": False, "error": f"empty output. stderr: {r.stderr[:200]}"}
+            except subprocess.TimeoutExpired:
+                return {"ok": False, "error": "pf CLI timeout"}
+            except Exception as e:
+                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        async def _resolve(
+            self, interaction: discord.Interaction, action: str,
+        ):
+            if self.resolved:
+                await interaction.response.send_message(
+                    "Sudah direspon~", ephemeral=True
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "Kamu tidak punya akses untuk konfirmasi ini~", ephemeral=True
+                )
+                return
+            self.resolved = True
+
+            # Defer to give us time to call pf
+            await interaction.response.defer()
+
+            if action == "verify":
+                payload = self._run_pf("tx", "verify", str(self.tx_id))
+                msg, color = self._format_verify_result(payload)
+                footer = f"Verified by {interaction.user.display_name}"
+            else:  # reject
+                payload = self._run_pf(
+                    "tx", "reject", str(self.tx_id),
+                    "--reason", f"user batal via button (by {interaction.user.display_name})",
+                )
+                if payload.get("ok"):
+                    msg = f"✗ Transaksi #{self.tx_id} dibatalkan."
+                    color = discord.Color.light_grey()
+                else:
+                    msg = f"⚠️ {payload.get('error', 'reject failed')}"
+                    color = discord.Color.red()
+                footer = f"Rejected by {interaction.user.display_name}"
+
+            embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+            embed.color = color
+            embed.description = msg
+            embed.set_footer(text=footer)
+
+            for child in self.children:
+                child.disabled = True
+
+            await interaction.message.edit(embed=embed, view=self)
+            logger.info(
+                "Discord tx confirm: tx=%s action=%s ok=%s by=%s",
+                self.tx_id, action, payload.get("ok"), interaction.user.display_name,
+            )
+
+        @discord.ui.button(label="Ya", style=discord.ButtonStyle.green, emoji="✅")
+        async def yes_btn(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await self._resolve(interaction, "verify")
+
+        @discord.ui.button(label="Batal", style=discord.ButtonStyle.red, emoji="❌")
+        async def no_btn(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await self._resolve(interaction, "reject")
 
         async def on_timeout(self):
             self.resolved = True

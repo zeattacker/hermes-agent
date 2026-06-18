@@ -76,7 +76,7 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_dir, get_hermes_home
 from utils import atomic_yaml_write, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -298,7 +298,7 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
     if not normalized:
         return set()
 
-    session_dir = _hermes_home / "whatsapp" / "session"
+    session_dir = get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
     resolved = set()
     queue = [normalized]
 
@@ -2782,6 +2782,56 @@ class GatewayRunner:
                 _update_prompts.pop(_quick_key, None)
                 label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
                 return f"✓ Sent `{label}` to the update process."
+
+        # Intercept WhatsApp button-click replies: ``pf_confirm:<id>`` or
+        # ``pf_reject:<id>``. The bridge surfaces a button tap as a normal
+        # inbound message whose body is the selectedButtonId. We run the
+        # `pf` CLI directly (verify/reject) and reply with a formatted
+        # result — no agent LLM round-trip needed for confirmation taps.
+        _btn_text = (event.text or "").strip()
+        _btn_match = re.match(r"^pf_(confirm|reject):(\d+)$", _btn_text)
+        if _btn_match:
+            _action = _btn_match.group(1)
+            _tx_id = int(_btn_match.group(2))
+            _adapter = self.adapters.get(source.platform)
+            if _adapter:
+                try:
+                    import subprocess
+                    _pf_args = ["/home/nvidia/.local/bin/pf", "tx"]
+                    if _action == "confirm":
+                        _pf_args += ["verify", str(_tx_id)]
+                    else:
+                        _pf_args += ["reject", str(_tx_id),
+                                     "--reason", f"user batal via button ({source.user_name or source.user_id})"]
+                    _r = subprocess.run(_pf_args, capture_output=True, text=True, timeout=10)
+                    _payload = json.loads(_r.stdout) if _r.stdout else {"ok": False, "error": _r.stderr[:200]}
+                except Exception as _e:
+                    _payload = {"ok": False, "error": f"{type(_e).__name__}: {_e}"}
+
+                if _action == "confirm" and _payload.get("ok"):
+                    _bal = _payload.get("balances") or {}
+                    if _bal:
+                        _f = _bal["from"]; _t = _bal["to"]
+                        _amt = _f["previous"] - _f["new"]
+                        _reply = (
+                            f"✓ Transfer Rp {_amt:,.0f} berhasil.\n"
+                            f"• {_f['name']}: Rp {_f['previous']:,.0f} → Rp {_f['new']:,.0f}\n"
+                            f"• {_t['name']}: Rp {_t['previous']:,.0f} → Rp {_t['new']:,.0f}"
+                        )
+                    else:
+                        _reply = f"✓ Transaksi #{_tx_id} verified."
+                elif _action == "reject" and _payload.get("ok"):
+                    _reply = f"✗ Transaksi #{_tx_id} dibatalkan."
+                else:
+                    _reply = f"⚠️ {_payload.get('error', 'unknown error')}"
+
+                try:
+                    await _adapter.send(source.chat_id, _reply)
+                except Exception as _se:
+                    logger.warning("Failed to send pf button reply: %s", _se)
+                logger.info("pf button: tx=%s action=%s ok=%s platform=%s",
+                            _tx_id, _action, _payload.get("ok"), source.platform.value if source.platform else "?")
+            return None
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages

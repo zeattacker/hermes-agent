@@ -39,6 +39,41 @@ logger = logging.getLogger(__name__)
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _TIMEOUT = 30.0
 
+# Turn filter — probes that must not pollute long-term memory.
+# Hermes auxiliary tasks (title generation, readiness checks, compression
+# probes) send short templated prompts through the regular turn pipeline,
+# so they end up in sync_turn unless filtered here. Matched on the *user*
+# side only; we keep the turn if the user wrote it themselves.
+_PROBE_PATTERNS = (
+    "reply with exactly",
+    "respond with exactly",
+    "respond with one word",
+    "output only",
+    "answer with only",
+    "generate a short title",
+    "summarize the following",
+)
+# Combined user+assistant char threshold — anything shorter than this
+# AND not human-typed (no whitespace-separated multi-sentence structure)
+# is almost certainly a probe.
+_MIN_TURN_CHARS = 40
+
+
+def _is_probe_turn(user_content: str, assistant_content: str) -> bool:
+    """Return True if this turn looks like a Hermes auxiliary probe."""
+    u = (user_content or "").strip()
+    a = (assistant_content or "").strip()
+    if not u:
+        return True
+    low = u.lower()
+    for pat in _PROBE_PATTERNS:
+        if pat in low:
+            return True
+    # Very short round-trips with no real content on either side
+    if len(u) + len(a) < _MIN_TURN_CHARS and "." not in u and "?" not in u:
+        return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Process-level atexit safety net — ensures pending sessions are committed
@@ -330,6 +365,26 @@ class OpenVikingMemoryProvider(MemoryProvider):
             logger.warning("httpx not installed — OpenViking plugin disabled")
             self._client = None
 
+        # Ensure the OV-side session exists. POST /sessions/{sid}/messages
+        # returns 500 if the session has not been created explicitly first
+        # (auto-create on message-post is NOT supported by the server), so
+        # sync_turn would silently drop every turn. Creating up front is
+        # idempotent on the server and cheap.
+        if self._client and session_id:
+            try:
+                self._client.post(
+                    "/api/v1/sessions", {"session_id": session_id}
+                )
+                logger.info(
+                    "OpenViking session %s ensured at %s",
+                    session_id, self._endpoint,
+                )
+            except Exception as e:
+                logger.warning(
+                    "OpenViking session %s create failed (sync_turn will retry): %s",
+                    session_id, e,
+                )
+
         # Register as the last active provider for atexit safety net
         global _last_active_provider
         _last_active_provider = self
@@ -370,6 +425,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
             self._prefetch_result = ""
         if not result:
             return ""
+        hit_count = result.count("\n- [") or 1
+        logger.info(
+            "OpenViking prefetch returned %d hit(s) for session %s",
+            hit_count, session_id or self._session_id,
+        )
         return f"## OpenViking Context\n{result}"
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -385,7 +445,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 )
                 resp = client.post("/api/v1/search/find", {
                     "query": query,
-                    "top_k": 5,
+                    "limit": 5,
                 })
                 result = resp.get("result", {})
                 parts = []
@@ -413,6 +473,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if not self._client:
             return
 
+        # Filter auxiliary probes (readiness checks, title generation,
+        # compression prompts) — these are machine-generated templated
+        # turns that would otherwise pollute long-term memory extraction.
+        if _is_probe_turn(user_content, assistant_content):
+            logger.debug(
+                "OpenViking sync_turn skipped (probe detected): %r -> %r",
+                user_content[:60], assistant_content[:60],
+            )
+            return
+
         self._turn_count += 1
 
         def _sync():
@@ -434,7 +504,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     "content": assistant_content[:4000],
                 })
             except Exception as e:
-                logger.debug("OpenViking sync_turn failed: %s", e)
+                logger.warning("OpenViking sync_turn failed: %s", e)
 
         # Wait for any previous sync to finish before starting a new one
         if self._sync_thread and self._sync_thread.is_alive():
@@ -540,7 +610,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if args.get("scope"):
             payload["target_uri"] = args["scope"]
         if args.get("limit"):
-            payload["top_k"] = args["limit"]
+            payload["limit"] = args["limit"]
 
         resp = self._client.post("/api/v1/search/find", payload)
         result = resp.get("result", {})

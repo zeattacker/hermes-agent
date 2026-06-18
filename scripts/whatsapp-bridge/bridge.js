@@ -243,7 +243,23 @@ async function startSocket() {
       let mediaType = '';
       const mediaUrls = [];
 
-      if (messageContent.conversation) {
+      // Button click reply (native Baileys buttonsResponseMessage)
+      // surfaces as a normal incoming text message whose body is the
+      // selectedButtonId — so downstream gateway can detect e.g. "pf_confirm:5"
+      // and intercept without LLM round-trip.
+      if (messageContent.buttonsResponseMessage?.selectedButtonId) {
+        body = messageContent.buttonsResponseMessage.selectedButtonId;
+      } else if (messageContent.templateButtonReplyMessage?.selectedId) {
+        body = messageContent.templateButtonReplyMessage.selectedId;
+      } else if (messageContent.interactiveResponseMessage) {
+        // Newer interactive button format
+        try {
+          const params = JSON.parse(
+            messageContent.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}'
+          );
+          if (params.id) body = params.id;
+        } catch {}
+      } else if (messageContent.conversation) {
         body = messageContent.conversation;
       } else if (messageContent.extendedTextMessage?.text) {
         body = messageContent.extendedTextMessage.text;
@@ -392,6 +408,43 @@ app.post('/send', async (req, res) => {
       }
     }
 
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send a button message (interactive Ya / Batal).
+// Body: { chatId, text, footer?, buttons: [{ id: "pf_confirm:5", label: "Ya" }, ...] }
+// NOTE: Native WhatsApp button support varies — Meta sometimes strips
+// buttons for unverified bot accounts, in which case the recipient sees
+// only the text + footer. Caller should be ready to fall back.
+app.post('/send-buttons', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chatId, text, footer, buttons } = req.body;
+  if (!chatId || !text || !Array.isArray(buttons) || buttons.length === 0) {
+    return res.status(400).json({ error: 'chatId, text, and non-empty buttons[] are required' });
+  }
+  try {
+    const buttonPayload = buttons.map((b) => ({
+      buttonId: String(b.id),
+      buttonText: { displayText: String(b.label) },
+      type: 1,
+    }));
+    const sent = await sock.sendMessage(chatId, {
+      text: formatOutgoingMessage(text),
+      footer: footer || undefined,
+      buttons: buttonPayload,
+      headerType: 1,
+    });
+    if (sent?.key?.id) {
+      recentlySentIds.add(sent.key.id);
+      if (recentlySentIds.size > MAX_RECENT_IDS) {
+        recentlySentIds.delete(recentlySentIds.values().next().value);
+      }
+    }
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
