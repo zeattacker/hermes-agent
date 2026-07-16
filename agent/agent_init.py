@@ -1206,6 +1206,23 @@ def init_agent(
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
 
+    # Don't advertise the built-in "memory" tool when there is no store backing
+    # it. The tool always dispatches to memory_tool(store=agent._memory_store)
+    # (see tool_executor), so with _memory_store None every call returns
+    # "Memory is not available" and the model retries in a tool loop. This
+    # happens on every skip_memory path (cron jobs, batch runs, review forks,
+    # delegate sub-agents) where the tool was still in the schema. OV provider
+    # tools are injected separately above under different names, so stripping
+    # "memory" here never affects them.
+    if getattr(agent, "_memory_store", None) is None and agent.tools:
+        agent.tools = [
+            t for t in agent.tools
+            if t.get("function", {}).get("name") != "memory"
+        ]
+        _valid = getattr(agent, "valid_tool_names", None)
+        if _valid is not None:
+            _valid.discard("memory")
+
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
     try:
