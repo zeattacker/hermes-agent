@@ -1460,6 +1460,44 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+_OUTER_FENCE_LANGS: frozenset = frozenset({"markdown", "md", "text", ""})
+
+
+def _strip_sole_outer_fence(text: str) -> str:
+    """Strip a single outer ```lang …``` fence when a cron agent wrapped its
+    whole response in one.
+
+    "Post this markdown verbatim" cron jobs feed the agent a pre-rendered
+    markdown block; smaller models re-wrap the reply in a ```markdown fence.
+    Discord/Slack then render the entire brief as raw grey monospace (no
+    headings/bold) and, because the added fence pushes long briefs past the
+    per-message limit, ``truncate_message`` splits them into several code-block
+    chunks — the "partial + unreadable code" symptom.
+
+    Conservative: only strips when the ENTIRE message is one top-level fence
+    with a whitelisted language tag (markdown/md/text/none) and balanced
+    internal fences.  Mirrors zexus ``morning_brief.render._strip_outer_fence``.
+    """
+    if not text:
+        return text
+    t = text.strip()
+    if not (t.startswith("```") and t.endswith("```")):
+        return text
+    lines = t.splitlines()
+    if len(lines) < 2:
+        return text
+    if lines[0].strip()[3:].strip().lower() not in _OUTER_FENCE_LANGS:
+        return text
+    if lines[-1].strip() != "```":
+        return text
+    body_lines = lines[1:-1]
+    # Odd number of bare closing fences inside = unbalanced internal block;
+    # stripping the outer fence would merge separate blocks. Leave it alone.
+    if sum(1 for ln in body_lines if ln.strip() == "```") % 2 != 0:
+        return text
+    return "\n".join(body_lines).strip()
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1471,6 +1509,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    # Belt-and-braces: undo an agent that re-wrapped its whole reply in a
+    # single ```markdown fence before it reaches any platform (#discord-briefs).
+    content = _strip_sole_outer_fence(content)
+
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
