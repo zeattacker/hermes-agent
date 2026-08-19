@@ -76,7 +76,39 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        # What a subscriber hears about. Terminal events by default — the
+        # original purpose was "tell me when this finishes" — but a fleet that
+        # wants to watch work happen can add progress kinds via
+        # `kanban.notify_kinds`. `commented` is the useful one: it carries the
+        # worker's own note, which is the only channel a kanban worker has for
+        # saying anything mid-task (there is no send_message tool by design).
+        DEFAULT_NOTIFY_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+        )
+        NOTIFIABLE_KINDS = frozenset(DEFAULT_NOTIFY_KINDS) | {"commented"}
+        _raw_kinds = kanban_cfg.get("notify_kinds", None)
+        if _raw_kinds is None:
+            TERMINAL_KINDS = DEFAULT_NOTIFY_KINDS
+        else:
+            if isinstance(_raw_kinds, str):
+                _raw_kinds = [k.strip() for k in _raw_kinds.split(",")]
+            _wanted = [str(k).strip() for k in (_raw_kinds or []) if str(k).strip()]
+            _unknown = [k for k in _wanted if k not in NOTIFIABLE_KINDS]
+            if _unknown:
+                logger.warning(
+                    "kanban notifier: ignoring unknown kanban.notify_kinds %s "
+                    "(known: %s)",
+                    _unknown, ", ".join(sorted(NOTIFIABLE_KINDS)),
+                )
+            TERMINAL_KINDS = tuple(k for k in _wanted if k in NOTIFIABLE_KINDS)
+            if not TERMINAL_KINDS:
+                logger.warning(
+                    "kanban notifier: kanban.notify_kinds resolved to nothing; "
+                    "falling back to the terminal defaults",
+                )
+                TERMINAL_KINDS = DEFAULT_NOTIFY_KINDS
+            logger.info("kanban notifier: notify_kinds=%s",
+                        ", ".join(TERMINAL_KINDS))
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -282,6 +314,19 @@ class GatewayKanbanWatchersMixin:
                                 f"✖ {tag}Kanban {sub['task_id']} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
+                        elif kind == "commented":
+                            # A worker talking while it works. The body rides
+                            # in the payload (kanban_db.add_comment); older
+                            # rows predate that and carry only a length, so
+                            # they are skipped rather than announced empty.
+                            body = ""
+                            if ev.payload and ev.payload.get("body"):
+                                body = str(ev.payload["body"]).strip()
+                            if not body:
+                                continue
+                            if ev.payload and ev.payload.get("truncated"):
+                                body += " […]"
+                            msg = f"💬 {tag}{title}\n{body}"
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):

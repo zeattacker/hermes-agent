@@ -2519,6 +2519,12 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
+# How much of a comment travels in its event payload. Long enough for a
+# worker's note to be readable on its own in chat, short enough that the
+# event log stays cheap to scan.
+_COMMENT_EVENT_BODY_CHARS = 1500
+
+
 def add_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str
 ) -> int:
@@ -2537,7 +2543,23 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        # Carry the comment itself, not just its length. The gateway notifier
+        # renders events straight from the payload — `completed` already ships
+        # its `summary` this way — and without the text a subscriber learns
+        # only that *a* comment happened, which is not worth a notification.
+        # Truncated here rather than at render time so one long comment cannot
+        # bloat every reader of the event log.
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {
+                "author": author,
+                "len": len(body),
+                "body": body.strip()[:_COMMENT_EVENT_BODY_CHARS],
+                "truncated": len(body.strip()) > _COMMENT_EVENT_BODY_CHARS,
+            },
+        )
         return int(cur.lastrowid or 0)
 
 
