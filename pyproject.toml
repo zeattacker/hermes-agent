@@ -135,6 +135,27 @@ dependencies = [
   # Hence the ``sys_platform == 'win32'`` marker: the dep (and its portalocker
   # / pywin32 tree) ships only where it's actually used.
   "concurrent-log-handler==0.9.29; sys_platform == 'win32'",
+  # MCP moved out of `[mcp]` and into core on 2026-08-19 (zexus fork).
+  #
+  # As an extra it failed in the worst possible way: `discover_mcp_tools()`
+  # checks `_MCP_AVAILABLE`, finds the package absent, logs
+  # "mcp package not installed -- MCP tool support disabled" at DEBUG and
+  # returns []. Hosts run at INFO, so nothing is printed, and
+  # `hermes mcp list` still shows every configured server as "enabled"
+  # because it reads config rather than the live client. Both available
+  # signals say healthy while every agent on the host has zero MCP tools.
+  #
+  # That was the state of this deployment from installation until it was
+  # found by hand, and it silently broke the QMD retrieval the night shift
+  # is built on.
+  #
+  # starlette is a lower bound rather than the ==1.0.1 pin the extras carry:
+  # that pin exists as a CVE-2026-48710 floor so a resolver cannot select a
+  # vulnerable pre-1.0.1 transitive, and pinning it exactly here would
+  # *downgrade* hosts already on a later patched release (this one runs
+  # 1.3.1 under fastapi 0.137.2).
+  "mcp==1.26.0",
+  "starlette>=1.0.1",  # CVE-2026-48710 (BadHost) floor, not a ceiling
 ]
 
 [project.optional-dependencies]
@@ -194,7 +215,10 @@ vision = []
 # `request.url` can be bypassed. We pin a patched Starlette directly in every
 # extra that exposes a Starlette-backed server surface so pip/uv can't resolve
 # a vulnerable pre-1.0.1 transitive. Bump in lockstep with uv.lock.
-mcp = ["mcp==1.26.0", "starlette==1.0.1"]  # starlette: CVE-2026-48710
+# mcp/starlette are core dependencies as of 2026-08-19; this extra is kept as a
+# back-compat alias so existing `pip install hermes-agent[mcp]` still resolves,
+# the same treatment `cron` got when croniter moved to core.
+mcp = []
 nemo-relay = ["nemo-relay==0.3"]
 homeassistant = ["aiohttp==3.13.4"]
 sms = ["aiohttp==3.13.4"]

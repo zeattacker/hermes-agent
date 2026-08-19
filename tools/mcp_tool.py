@@ -2837,6 +2837,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 if hasattr(block, "text") and block.text:
                     parts.append(block.text)
                     continue
+                # EmbeddedResource (type="resource") carries its payload one
+                # level down, at block.resource.text — the block itself has no
+                # .text, so the checks above skip it and it used to vanish the
+                # same way image blocks did before #17915. Servers that return
+                # file contents this way (QMD's `get`) handed the agent an
+                # empty string with no error, which reads as "the document is
+                # blank" rather than "Hermes dropped it".
+                resource = getattr(block, "resource", None)
+                if resource is not None:
+                    resource_text = getattr(resource, "text", None)
+                    if resource_text:
+                        parts.append(resource_text)
+                        continue
                 image_tag = _cache_mcp_image_block(block)
                 if image_tag:
                     parts.append(image_tag)
