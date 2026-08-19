@@ -187,6 +187,13 @@ matrix = ["mautrix[encryption]==0.21.0", "aiosqlite==0.22.1", "asyncpg==0.31.0",
 # here to keep the dependency local to wecom_callback's threat model.
 wecom = ["defusedxml==0.7.1"]
 cli = ["simple-term-menu==1.6.6"]
+# Langfuse observability plugin (plugins/observability/langfuse). Cannot be
+# lazy-installed: the plugin imports the SDK at module scope when the plugin
+# loader runs at process start, long before any tool call could trigger
+# LAZY_DEPS. Without the SDK the hooks are silently inert — the plugin
+# fails open by design — so a missing dependency looks exactly like a
+# working-but-quiet tracer. Hence [all] rather than lazy.
+observability = ["langfuse==4.14.4"]
 tts-premium = ["elevenlabs==1.59.0"]
 voice = [
   # Local STT pulls in wheel-only transitive deps (ctranslate2, onnxruntime),
@@ -315,6 +322,7 @@ all = [
   "hermes-agent[google]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
+  "hermes-agent[observability]",
 ]
 
 [project.scripts]
