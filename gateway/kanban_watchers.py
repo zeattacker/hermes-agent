@@ -64,9 +64,25 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        # Notifying is not dispatching. Sharing one switch means a board with
+        # a single dispatcher — which is what a shared SQLite board wants —
+        # also has a single voice: every card's comments reach chat under the
+        # dispatching profile's identity, whoever actually did the work. On
+        # 2026-08-19 that put cipher's and orion's reasoning into their own
+        # division channels under Zenith's name.
+        #
+        # `notify_in_gateway` splits the two and defaults to the old value,
+        # so a config that never sets it behaves exactly as before. A gateway
+        # only ever delivers subscriptions tagged with its own profile (see
+        # the owner_profile check below), so turning this on for several
+        # gateways divides the work rather than duplicating it.
+        notify = kanban_cfg.get("notify_in_gateway")
+        if notify is None:
+            notify = kanban_cfg.get("dispatch_in_gateway", True)
+        if not notify:
             logger.info(
-                "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
+                "kanban notifier: disabled via config kanban.notify_in_gateway="
+                "false (or dispatch_in_gateway=false with no override)"
             )
             return
         from gateway.config import Platform as _Platform
@@ -326,7 +342,17 @@ class GatewayKanbanWatchersMixin:
                                 continue
                             if ev.payload and ev.payload.get("truncated"):
                                 body += " […]"
-                            msg = f"💬 {tag}{title}\n{body}"
+                            # A worker narrates several times per card, so the
+                            # header repeats on every line of a channel. Keep
+                            # just enough of the title to tell two cards apart
+                            # and wrap it: kanban titles are document names
+                            # full of underscores, and unwrapped they reach
+                            # Discord as emphasis with the underscores eaten
+                            # (measured 2026-08-20 — `02.6_2026 - 08 Agustus`
+                            # arrived in italics, `siap_psikologi` as
+                            # `siappsikologi`).
+                            short = title if len(title) <= 70 else title[:69] + "…"
+                            msg = f"💬 {tag}`{short}`\n{body}"
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
