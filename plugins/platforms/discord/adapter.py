@@ -58,6 +58,8 @@ from gateway.config import Platform, PlatformConfig
 import re
 
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
+
+from .bot_turn_limit import BotTurnLimiter
 from utils import atomic_json_write
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -661,6 +663,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
+        # Bounds bot-to-bot exchanges once DISCORD_ALLOW_BOTS is enabled.
+        # Inert while it is unset: no bot message reaches the counter.
+        self._bot_turns = BotTurnLimiter()
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -909,9 +914,32 @@ class DiscordAdapter(BasePlatformAdapter):
                     elif allow_bots == "mentions":
                         if not self._client.user or self._client.user not in message.mentions:
                             return
+                    # The bot is permitted. Nothing above bounds how long two
+                    # agents may keep answering each other, and the routing
+                    # above makes a ping-pong *more* likely, not less: a reply
+                    # that mentions the sender is exactly what reaches us.
+                    # Unbounded, the pair runs until a gateway stops — at
+                    # three in the morning, in a channel nobody watches,
+                    # against a metered LLM. Circuit breaker, not policy: the
+                    # ceiling should be high enough that no real standup
+                    # reaches it, and reaching it means something is looping.
+                    if not adapter_self._bot_turns.allow_bot_turn(
+                        str(getattr(message.channel, "id", "")),
+                    ):
+                        logger.warning(
+                            "discord: bot-to-bot turn limit reached in channel %s; "
+                            "ignoring further bot messages until a human speaks "
+                            "or the channel goes quiet",
+                            getattr(message.channel, "id", "?"),
+                        )
+                        return
                     # "all" falls through; bot is permitted — skip the
                     # human-user allowlist below (bots aren't in it).
                 else:
+                    # A person spoke: the channel is attended, and whatever
+                    # the bots were doing before is over.
+                    adapter_self._bot_turns.note_human(
+                        str(getattr(message.channel, "id", "")))
                     # Non-bot: enforce the configured user/role allowlists.
                     # Pass guild + is_dm so role checks are scoped to the
                     # originating guild (prevents cross-guild DM bypass, see
