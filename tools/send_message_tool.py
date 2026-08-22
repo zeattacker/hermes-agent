@@ -146,8 +146,8 @@ SEND_MESSAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["send", "list", "react", "unreact"],
-                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction."
+                "enum": ["send", "list", "react", "unreact", "create_thread"],
+                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction. 'create_thread' opens a thread in a channel and returns its id, for callers that want to narrate somewhere other than the channel itself."
             },
             "target": {
                 "type": "string",
@@ -164,6 +164,10 @@ SEND_MESSAGE_SCHEMA = {
             "message_id": {
                 "type": "string",
                 "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
+            },
+            "name": {
+                "type": "string",
+                "description": "For action='create_thread': the thread's title, capped at 100 characters by the platform."
             }
         },
         "required": []
@@ -184,7 +188,83 @@ def send_message_tool(args, **kw):
     if action == "unreact":
         return _handle_react(args, remove=True)
 
+    if action == "create_thread":
+        return _handle_create_thread(args)
+
     return _handle_send(args)
+
+
+def _handle_create_thread(args):
+    """Open a thread in a channel and return its id.
+
+    Sending TO a thread already works everywhere — ``platform:chat:thread``.
+    Creating one had no headless path at all: the platform adapters bind it
+    to an inbound interaction. A cron, or anything seeding work items that
+    each want their own place to be discussed, could not open one.
+
+    Resolution follows ``_handle_send`` deliberately, including friendly
+    channel names, so a caller does not have to know a numeric id here and
+    not there.
+    """
+    target = args.get("target", "")
+    name = (args.get("name") or "").strip()
+    if not target or not name:
+        return tool_error("Both 'target' and 'name' are required when "
+                          "action='create_thread'")
+
+    parts = target.split(":", 1)
+    platform_name = parts[0].strip().lower()
+    target_ref = parts[1].strip() if len(parts) > 1 else ""
+    if not target_ref:
+        return tool_error("create_thread needs a channel, not just a platform")
+
+    chat_id, _thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
+    if not is_explicit:
+        try:
+            from gateway.channel_directory import resolve_channel_name
+            resolved = resolve_channel_name(platform_name, target_ref)
+        except Exception:
+            resolved = None
+        if not resolved:
+            return json.dumps({
+                "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                         f"Use send_message(action='list') to see targets."})
+        chat_id, _thread_id, _ = _parse_target_ref(platform_name, resolved)
+
+    try:
+        from gateway.config import load_gateway_config, Platform
+        config = load_gateway_config()
+        platform = Platform(platform_name)
+    except Exception as e:
+        return json.dumps(_error(f"Failed to load gateway config: {e}"))
+
+    pconfig = config.platforms.get(platform)
+    if not pconfig or not pconfig.enabled:
+        return tool_error(f"Platform '{platform_name}' is not configured.")
+
+    try:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform_name)
+    except Exception:
+        entry = None
+    if entry is None or entry.standalone_thread_fn is None:
+        return tool_error(
+            f"'{platform_name}' cannot open a thread from outside the "
+            f"gateway: no standalone_thread_fn is registered for it.")
+
+    seed = (args.get("message") or "").strip()
+    try:
+        from model_tools import _run_async
+        result = _run_async(entry.standalone_thread_fn(
+            pconfig, chat_id, name, seed_message=seed))
+    except Exception as e:
+        return json.dumps(_error(f"create_thread failed: {e}"))
+    if not isinstance(result, dict) or "thread_id" not in result:
+        return json.dumps(_error(
+            (result or {}).get("error", "create_thread returned no thread_id")
+            if isinstance(result, dict) else "create_thread returned no dict"))
+    return json.dumps({"success": True, "thread_id": result["thread_id"],
+                       "target": f"{platform_name}:{chat_id}:{result['thread_id']}"})
 
 
 def _handle_list():

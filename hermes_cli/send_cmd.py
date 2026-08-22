@@ -315,6 +315,35 @@ def cmd_send(args: argparse.Namespace) -> None:
         )
         sys.exit(_USAGE_EXIT)
 
+    # --create-thread opens a thread and prints its id, then stops. The
+    # message body is optional here and becomes the thread's opening post: a
+    # caller that has nothing to say yet still gets a usable thread, which is
+    # the whole point for anything seeding work items ahead of the work.
+    thread_name = getattr(args, "create_thread", None)
+    if thread_name:
+        import json as _json
+
+        from tools.send_message_tool import send_message_tool
+        seed = _read_message_body(getattr(args, "message", None),
+                                  getattr(args, "file", None)) or ""
+        result = send_message_tool({
+            "action": "create_thread", "target": target,
+            "name": thread_name, "message": seed,
+        })
+        try:
+            payload = _json.loads(result)
+        except ValueError:
+            payload = {"error": result}
+        if payload.get("thread_id"):
+            # Bare id under --quiet so `$(hermes send --create-thread …)`
+            # can be assigned straight into a variable.
+            print(payload["thread_id"] if getattr(args, "quiet", False)
+                  else payload["target"])
+            sys.exit(0)
+        print(f"hermes send: {payload.get('error', 'create_thread failed')}",
+              file=sys.stderr)
+        sys.exit(1)
+
     message = _read_message_body(
         getattr(args, "message", None),
         getattr(args, "file", None),
@@ -439,6 +468,16 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="List available targets. Optional positional filter: `hermes send --list telegram`.",
+    )
+
+    parser.add_argument(
+        "--create-thread",
+        metavar="NAME",
+        help=(
+            "Open a thread named NAME in the --to channel, print its target "
+            "(or the bare id with --quiet), and exit. Any message body "
+            "becomes the thread's opening post. Discord only for now."
+        ),
     )
 
     parser.add_argument(

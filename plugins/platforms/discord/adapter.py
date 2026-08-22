@@ -6759,6 +6759,108 @@ async def _standalone_send(
         return {"error": _standalone_sanitize_error(f"Discord send failed: {e}")}
 
 
+async def _standalone_create_thread(
+    pconfig,
+    chat_id: str,
+    name: str,
+    *,
+    seed_message: str = "",
+    auto_archive_minutes: int = 1440,
+) -> Dict[str, Any]:
+    """Create a thread in a TEXT channel, without a live gateway adapter.
+
+    ``_standalone_send`` already creates threads, but only in forum channels,
+    where Discord requires it. A text channel has no outbound path at all:
+    ``_create_thread`` takes a ``discord.Interaction`` and is bound to the
+    ``/thread`` slash command, and ``_auto_create_thread`` fires only on an
+    inbound @mention. So a headless caller — a cron, a producer seeding
+    cards — cannot open a thread to narrate into.
+
+    Two routes, and the fallback is not decoration: Discord refuses a bare
+    ``POST /channels/{id}/threads`` under some permission sets, and the
+    message-anchored form is what ``_create_thread`` has always used. When a
+    ``seed_message`` is given the anchored form is taken directly, so the
+    thread opens with something in it rather than empty.
+
+    Never raises. Returns ``{"thread_id": ...}`` or ``{"error": ...}``: the
+    caller is expected to carry on without a thread rather than lose the
+    message it was about to send.
+    """
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
+    token = (getattr(pconfig, "token", None) or os.getenv("DISCORD_BOT_TOKEN", "")).strip()
+    if not token:
+        return {"error": "Discord standalone create_thread: DISCORD_BOT_TOKEN is not set"}
+
+    thread_name = (name or "").strip()[:100] or "New Thread"
+
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        auth_headers = {"Authorization": f"Bot {token}"}
+        json_headers = {**auth_headers, "Content-Type": "application/json"}
+        base = f"https://discord.com/api/v10/channels/{chat_id}"
+        attempts: list[str] = []
+
+        async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+
+            async def _anchored() -> Dict[str, Any]:
+                """Seed a message, then hang a thread off it."""
+                async with session.post(
+                        f"{base}/messages", headers=json_headers,
+                        json={"content": seed_message or thread_name},
+                        **_req_kw) as resp:
+                    if resp.status not in {200, 201}:
+                        return {"error": f"seed message failed ({resp.status}): "
+                                         f"{(await resp.text())[:300]}"}
+                    seed = await resp.json()
+                anchor = seed.get("id")
+                async with session.post(
+                        f"{base}/messages/{anchor}/threads", headers=json_headers,
+                        json={"name": thread_name,
+                              "auto_archive_duration": auto_archive_minutes},
+                        **_req_kw) as resp:
+                    if resp.status not in {200, 201}:
+                        return {"error": f"thread from message failed "
+                                         f"({resp.status}): "
+                                         f"{(await resp.text())[:300]}"}
+                    return {"thread_id": (await resp.json()).get("id"),
+                            "seed_message_id": anchor}
+
+            if seed_message:
+                out = await _anchored()
+                if "thread_id" in out:
+                    return out
+                attempts.append(str(out.get("error")))
+            else:
+                # 11 = PUBLIC_THREAD. Without a message to anchor to, this is
+                # the only form that leaves the channel clean.
+                async with session.post(
+                        f"{base}/threads", headers=json_headers,
+                        json={"name": thread_name, "type": 11,
+                              "auto_archive_duration": auto_archive_minutes},
+                        **_req_kw) as resp:
+                    if resp.status in {200, 201}:
+                        return {"thread_id": (await resp.json()).get("id")}
+                    attempts.append(f"direct ({resp.status}): "
+                                    f"{(await resp.text())[:300]}")
+                out = await _anchored()
+                if "thread_id" in out:
+                    return out
+                attempts.append(str(out.get("error")))
+
+        return {"error": _standalone_sanitize_error(
+            "Discord create_thread failed — " + " | ".join(attempts))}
+    except Exception as e:
+        return {"error": _standalone_sanitize_error(
+            f"Discord create_thread failed: {e}")}
+
+
 # ── Plugin entry point ────────────────────────────────────────────────────────
 
 
@@ -6999,6 +7101,7 @@ def register(ctx) -> None:
         # hook, ``deliver=discord`` cron jobs fail with "No live adapter"
         # when cron runs separately from the gateway.  Mirrors Teams pattern.
         standalone_sender_fn=_standalone_send,
+        standalone_thread_fn=_standalone_create_thread,
         # Discord hard limit per message
         max_message_length=2000,
         # Display

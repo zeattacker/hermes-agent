@@ -158,6 +158,21 @@ class PlatformEntry:
     # targets when the gateway is not co-resident with the cron process.
     standalone_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
 
+    # Optional: open a thread/topic in a channel without a live adapter.
+    #
+    # Signature:
+    #     async (pconfig, chat_id, name, *, seed_message="") -> dict
+    #
+    # Returns ``{"thread_id": ...}`` on success or ``{"error": str}`` on
+    # failure, and must not raise — a caller that cannot open a thread is
+    # expected to carry on posting to the channel, not to lose the message.
+    #
+    # Separate from ``standalone_sender_fn`` because sending to a thread and
+    # creating one are different capabilities: every platform with threads
+    # can be sent to via ``thread_id``, but only some let a headless process
+    # open one.
+    standalone_thread_fn: Optional[Callable[..., Awaitable[dict]]] = None
+
 
 class PlatformRegistry:
     """Central registry of platform adapters.
