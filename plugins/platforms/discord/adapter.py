@@ -59,6 +59,7 @@ import re
 
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
 
+from .bot_scope import channel_in_scope
 from .bot_turn_limit import BotTurnLimiter
 from utils import atomic_json_write
 from gateway.platforms.base import (
@@ -909,6 +910,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 _role_authorized = False
                 if getattr(message.author, "bot", False):
                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+                    # DISCORD_ALLOW_BOTS_CHANNELS narrows the mode to named
+                    # channels. Letting agents talk to each other is useful in
+                    # exactly one room — a standup, a triage huddle — and
+                    # nowhere else: every other channel is where their output
+                    # is read, and turning the whole server bot-to-bot to get
+                    # one room is a poor trade. Unset means server-wide, which
+                    # is what the setting did before this existed.
+                    if not channel_in_scope(
+                        os.getenv("DISCORD_ALLOW_BOTS_CHANNELS"),
+                        str(getattr(message.channel, "id", "")),
+                        str(getattr(getattr(message.channel, "parent", None),
+                                    "id", "") or ""),
+                    ):
+                        return
                     if allow_bots == "none":
                         return
                     elif allow_bots == "mentions":
