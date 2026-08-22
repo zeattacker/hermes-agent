@@ -4211,6 +4211,16 @@ class DiscordAdapter(BasePlatformAdapter):
         if limit <= 0:
             return ""
 
+        # Rooms where agents must not read each other's turns as context.
+        # See bot_scope.history_in_scope for what this was measured against.
+        from .bot_scope import history_in_scope
+        if not history_in_scope(
+            os.getenv("DISCORD_HISTORY_BACKFILL_EXCLUDE_CHANNELS"),
+            str(getattr(channel, "id", "")),
+            str(getattr(getattr(channel, "parent", None), "id", "") or ""),
+        ):
+            return ""
+
         # Determine which bot messages to include in context
         allow_bots_raw = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
         include_other_bots = allow_bots_raw != "none"

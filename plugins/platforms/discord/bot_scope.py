@@ -40,3 +40,33 @@ def channel_in_scope(raw_scope: Optional[str], channel_id: str,
     if not scope:
         return True
     return str(channel_id) in scope or (bool(parent_id) and str(parent_id) in scope)
+
+
+def history_in_scope(raw_exclude: Optional[str], channel_id: str,
+                     parent_id: str = "") -> bool:
+    """May the recent-channel-messages block be prepended here?
+
+    ``DISCORD_ALLOW_BOTS`` turns out to govern two different things: whether
+    another bot's message *triggers* a turn, and whether it is *included* in
+    the backfilled context block. Measured 2026-08-22 in a live standup —
+    orion's turn arrived as 7,558 characters opening "[Recent channel
+    messages]" and carrying cipher's, ledger's and nova's answers verbatim.
+    Orion answered with nova's sentence, "semua aktivitas hari ini murni
+    administratif Marketing", as its own.
+
+    Worse, zenith's closing summary of the previous run was in there too, so
+    each run fed the next one its own paraphrase.
+
+    A standup is exactly the room where agents must NOT read each other
+    freely: the whole design is that a claim reaches the division it names
+    through a controlled relay, with the claim attributed. Uncontrolled
+    context turns that into copying.
+
+    Unset means backfill everywhere, which is what happened before this
+    existed. Nothing changes for anyone who does not set it.
+    """
+    excluded = parse_scope(raw_exclude)
+    if not excluded:
+        return True
+    return not (str(channel_id) in excluded
+                or (bool(parent_id) and str(parent_id) in excluded))

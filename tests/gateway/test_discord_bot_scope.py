@@ -35,3 +35,26 @@ def test_a_thread_inherits_its_parent_channel():
 def test_hash_prefixes_and_spacing_are_tolerated():
     assert parse_scope(" #standup , 123 ,, ") == {"standup", "123"}
     assert channel_in_scope("#standup, #brain", "standup") is True
+
+
+# ── where the recent-channel-messages block may be prepended ───────────────
+
+
+def test_history_backfill_is_everywhere_when_unset():
+    from plugins.platforms.discord.bot_scope import history_in_scope
+    assert history_in_scope(None, "123") is True
+    assert history_in_scope("", "123") is True
+
+
+def test_an_excluded_channel_gets_no_backfill():
+    """Measured 2026-08-22: orion's standup turn arrived as 7,558 characters
+    opening "[Recent channel messages]", carrying nova's answer verbatim —
+    and orion answered with nova's sentence as its own."""
+    from plugins.platforms.discord.bot_scope import history_in_scope
+    assert history_in_scope("1494849990231724032", "1494849990231724032") is False
+    assert history_in_scope("1494849990231724032", "999") is True
+
+
+def test_a_thread_inherits_its_parent_s_exclusion():
+    from plugins.platforms.discord.bot_scope import history_in_scope
+    assert history_in_scope("111", "222", "111") is False
