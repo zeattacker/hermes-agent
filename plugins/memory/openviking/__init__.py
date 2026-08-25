@@ -2440,9 +2440,29 @@ class OpenVikingMemoryProvider(MemoryProvider):
         )
 
     def _build_memory_uri(self, subdir: str) -> str:
-        """Build a viking:// memory URI under the configured user/agent/subdir."""
+        """Build a viking:// memory URI in this agent's peer space.
+
+        `viking://user/{user}/agent/{agent}/...` is not a shape OpenViking
+        knows. The server accepts it — nothing validates a user subdirectory —
+        but no retrieval target ever covers it: `default_target_directories`
+        resolves memory to `{user}/memories` and `{user}/peers/{actor}/memories`
+        and nothing else. Everything written under the old path has been
+        invisible to recall since it was first used.
+
+        It was harmless while each agent had its own user scope. Once the fleet
+        moved to a shared `gamatecha` user (2026-08-25) it became actively
+        wrong: five agents writing a private subtree into the shared scope,
+        none of them able to read any of it.
+
+        `peers/{agent_id}` is the shape the server names in its own deprecation
+        notice for `viking://agent/{agent_id}`, and it is one of the two
+        default memory targets — so a write here is recalled on the next turn.
+        """
         slug = uuid.uuid4().hex[:12]
-        return f"viking://user/{self._user}/agent/{self._agent}/memories/{subdir}/mem_{slug}.md"
+        return (
+            f"viking://user/{self._user}/peers/{self._agent}"
+            f"/memories/{subdir}/mem_{slug}.md"
+        )
 
     def on_memory_write(
         self,
