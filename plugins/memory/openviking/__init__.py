@@ -1979,13 +1979,60 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "viking_remember, viking_add_resource."
             )
 
+    @staticmethod
+    def _format_prefetch_hits(result: Dict[str, Any]) -> str:
+        """Render a /search/find result into prefetch context lines.
+
+        Shared by the background thread and the synchronous fallback so both
+        paths inject byte-identical text.
+        """
+        parts = []
+        for ctx_type in ("memories", "resources"):
+            for item in (result.get(ctx_type) or [])[:3]:
+                abstract = item.get("abstract", "")
+                if not abstract:
+                    continue
+                parts.append(
+                    f"- [{item.get('score', 0):.2f}] {abstract} ({item.get('uri', '')})"
+                )
+        return "\n".join(parts)
+
+    def _prefetch_sync(self, query: str) -> str:
+        """Recall for THIS turn's query, right now.
+
+        The background path (``queue_prefetch``) is fired at the END of a turn
+        and consumed at the START of the next one, so it carries the PREVIOUS
+        turn's query and is empty on the first turn of any session. That is
+        fine for long interactive chats and useless for the way this fleet
+        actually runs: every kanban card and every cron job is a fresh session
+        whose first turn is the only turn that matters. Measured 2026-08-25 —
+        a real card dispatch made 9 tool calls, none of them to OpenViking,
+        because nothing was ever injected.
+
+        So when the background slot is empty we do the recall inline. Bounded
+        and fail-open: a slow or dead OpenViking costs one timeout and returns
+        no context, never a failed turn.
+        """
+        if not self._client or not query:
+            return ""
+        try:
+            resp = self._client.post(
+                "/api/v1/search/find", {"query": query, "limit": 5}
+            )
+            return self._format_prefetch_hits(resp.get("result", {}) or {})
+        except Exception as e:
+            logger.debug("OpenViking synchronous prefetch failed: %s", e)
+            return ""
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return prefetched results from the background thread."""
+        """Return context for the upcoming turn (background slot, else inline)."""
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             result = self._prefetch_result
             self._prefetch_result = ""
+        if not result:
+            result = self._prefetch_sync(_derive_openviking_user_text(query))
         if not result:
             return ""
         return f"## OpenViking Context\n{result}"
@@ -2012,21 +2059,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     "query": query,
                     "limit": 5,
                 })
-                result = resp.get("result", {})
-                parts = []
-                for ctx_type in ("memories", "resources"):
-                    items = result.get(ctx_type, [])
-                    for item in items[:3]:
-                        uri = item.get("uri", "")
-                        abstract = item.get("abstract", "")
-                        score = item.get("score", 0)
-                        if abstract:
-                            parts.append(f"- [{score:.2f}] {abstract} ({uri})")
-                if parts:
+                rendered = self._format_prefetch_hits(resp.get("result", {}) or {})
+                if rendered:
                     with self._prefetch_lock:
                         if gen != self._prefetch_generation:
                             return
-                        self._prefetch_result = "\n".join(parts)
+                        self._prefetch_result = rendered
             except Exception as e:
                 logger.debug("OpenViking prefetch failed: %s", e)
             finally:
