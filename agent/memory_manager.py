@@ -26,6 +26,7 @@ Usage in run_agent.py:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import inspect
 import threading
@@ -449,6 +450,48 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
+    @staticmethod
+    def _resolve_kanban_stub(text: str) -> str:
+        """Turn the kanban dispatch stub into text worth recalling on.
+
+        Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``
+        (see ``cli.py``); the card id is a pointer, not a description, so every
+        memory provider receives a query that matches nothing in its store. The
+        first turn of a card run — the only turn for most cards — therefore gets
+        no recalled context at all. Measured 2026-08-25: recalling on the stub
+        returned 0 hits, on the card title 3 hits with a 1.00 top score.
+
+        ``cli.py`` already resolves the same stub against the board to route
+        images out of the task body; this is that pattern applied to recall.
+        Title only, not title+body: the body carries Drive paths, MIME types
+        and boilerplate that measurably dilute the query (top score 1.00 -> 0.97).
+
+        Fixed here rather than in one plugin because the stub reaches every
+        provider — mem0, honcho, supermemory and the rest see it too.
+
+        Replaces the text only when it is exactly the stub for the task this
+        process was spawned for; a real prompt always wins.
+        """
+        task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        if not task_id or text.strip() != f"work kanban task {task_id}":
+            return text
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            conn = _kb.connect()
+            try:
+                task = _kb.get_task(conn, task_id)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            title = (getattr(task, "title", "") or "").strip()
+            return title or text
+        except Exception as e:
+            logger.debug("Kanban stub resolution failed (non-fatal): %s", e)
+            return text
+
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Collect prefetch context from all providers.
 
@@ -458,6 +501,7 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
+        clean_query = self._resolve_kanban_stub(clean_query)
         parts = []
         for provider in self._providers:
             try:
@@ -485,6 +529,7 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return
+        clean_query = self._resolve_kanban_stub(clean_query)
 
         def _run() -> None:
             for provider in providers:
