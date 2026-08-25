@@ -81,6 +81,46 @@ _CATEGORY_SUBDIR_MAP = {
 }
 _DEFAULT_MEMORY_SUBDIR = "preferences"
 
+# OpenViking's `preferences` memory type declares an embedding template —
+# `{{ user }}\n\n{{ topic }}\n\n{{ content }}` — and renders it at write time
+# to decide what text becomes the vector. If any variable is missing it logs
+# once and silently falls back to the bare body, so the record's own subject
+# never reaches its vector. Everything this plugin has ever written took that
+# fallback: content/write posts a body and nothing else.
+#
+# Measured 2026-08-25 on a migrated peer record: with the topic only in the
+# filename the record scored 0.18 for its own subject; with the topic inside
+# the embedded text, 0.46. `embedding.text_source: content_only` is why the
+# filename cannot rescue it — filenames are never embedded, and there is no
+# setting that makes them so.
+#
+# Scoped deliberately to `preferences`. `entities` needs a category and
+# `events` needs a goal, and neither is knowable from a free-text memory; the
+# template is all-or-nothing, so a guessed value would be embedded as fact to
+# buy back a fallback that is merely lossy. Losing the vector beats inventing
+# the record.
+_PREFERENCE_FIELD_SUBDIR = "preferences"
+_TOPIC_MAX_CHARS = 60
+
+
+def _derive_topic(content: str) -> str:
+    """A short subject line for a memory that did not name one.
+
+    First non-empty line, stripped of the markdown that makes it a heading or
+    a bullet. Not a summary — a label, and a wrong label is no worse than the
+    empty string it replaces, because the body is embedded either way.
+    """
+    for raw in (content or "").splitlines():
+        line = raw.strip().lstrip("#").lstrip("-*> ").strip()
+        line = re.sub(r"[*_`\[\]]", "", line).strip()
+        if not line:
+            continue
+        if len(line) > _TOPIC_MAX_CHARS:
+            cut = line[:_TOPIC_MAX_CHARS].rsplit(" ", 1)[0]
+            line = (cut or line[:_TOPIC_MAX_CHARS]).rstrip(",;:.") + "…"
+        return line
+    return ""
+
 # Maps the built-in memory tool's `target` ("user" vs "memory") to a subdir
 # for on_memory_write mirroring. User profile facts → preferences; agent
 # notes / observations → patterns. Anything unknown falls back to the default.
@@ -406,6 +446,14 @@ REMEMBER_SCHEMA = {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "The information to remember."},
+            "topic": {
+                "type": "string",
+                "description": (
+                    "Short subject of this memory, a few words. Becomes part "
+                    "of what is searched, so name the thing the memory is "
+                    "about. Derived from the first line when omitted."
+                ),
+            },
             "category": {
                 "type": "string",
                 "enum": ["preference", "entity", "event", "case", "pattern"],
@@ -2439,6 +2487,25 @@ class OpenVikingMemoryProvider(MemoryProvider):
             old_session_id, new_id, parent_session_id, reset,
         )
 
+    def _with_memory_fields(self, subdir: str, content: str,
+                            topic: str = "") -> str:
+        """Append the MEMORY_FIELDS trailer the destination type needs.
+
+        The trailer is `<!-- MEMORY_FIELDS {json} -->`. OpenViking strips it
+        before anything reads the body, so this changes what is embedded
+        without changing what a human sees.
+        """
+        if subdir != _PREFERENCE_FIELD_SUBDIR:
+            return content
+        subject = (topic or "").strip() or _derive_topic(content)
+        if not subject:
+            return content
+        fields = {"user": self._user, "topic": subject}
+        return (
+            f"{content.rstrip()}\n\n"
+            f"<!-- MEMORY_FIELDS {json.dumps(fields, ensure_ascii=False)} -->\n"
+        )
+
     def _build_memory_uri(self, subdir: str) -> str:
         """Build a viking:// memory URI in this agent's peer space.
 
@@ -2486,7 +2553,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 )
                 client.post("/api/v1/content/write", {
                     "uri": uri,
-                    "content": content,
+                    "content": self._with_memory_fields(subdir, content),
                     "mode": "create",
                 })
             except Exception as e:
@@ -2741,6 +2808,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         category = args.get("category", "")
         subdir = _CATEGORY_SUBDIR_MAP.get(category, _DEFAULT_MEMORY_SUBDIR)
         uri = self._build_memory_uri(subdir)
+        content = self._with_memory_fields(subdir, content,
+                                           args.get("topic", ""))
 
         # Write directly via content/write API.
         # This creates the file, stores the content, and queues vector indexing
