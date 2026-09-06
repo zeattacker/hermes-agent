@@ -6044,6 +6044,35 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def has_live_workers(conn: sqlite3.Connection) -> bool:
+    """Return True iff a worker is running right now on a claim that is alive.
+
+    The health telemetry counts a tick as bad when ready work is waiting and
+    nothing spawned, which conflates two states that look identical from
+    outside: a dispatcher that CANNOT spawn (broken venv, lost credentials)
+    and one that WILL NOT because every slot is already taken.
+
+    Measured on the night of 2026-09-05: the warning fired six times between
+    22:34 and 01:19 while the dispatcher was spawning 12-19 times an hour,
+    and the night finished all sixty of its tasks with an empty board. There
+    was nothing to check; the queue was simply longer than
+    ``max_in_progress``.
+
+    A claim past ``claim_expires`` does not count. That worker is gone, the
+    reclaimer has not caught it yet, and a queue held behind a dead claim is
+    exactly what this warning should still fire on.
+    """
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT 1 FROM tasks "
+        "WHERE status = 'running' AND claim_lock IS NOT NULL "
+        "  AND (claim_expires IS NULL OR claim_expires > ?) "
+        "LIMIT 1",
+        (now,),
+    ).fetchone()
+    return row is not None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,

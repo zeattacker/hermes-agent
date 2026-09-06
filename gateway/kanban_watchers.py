@@ -973,6 +973,34 @@ class GatewayKanbanWatchersMixin:
                             pass
             return False
 
+        def _workers_live() -> bool:
+            """Is any board currently running a worker on a live claim?
+
+            The stuck warning asks "ready work waiting and nothing spawned",
+            which is also exactly what a dispatcher at ``max_in_progress``
+            looks like. This is the difference between the two.
+            """
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            for b in boards:
+                slug = b.get("slug") or _kb.DEFAULT_BOARD
+                conn = None
+                try:
+                    conn = _kb.connect(board=slug)
+                    if _kb.has_live_workers(conn):
+                        return True
+                except Exception:
+                    continue
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+            return False
+
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
         # ``kanban.auto_decompose`` (default True). Capped by
@@ -1107,7 +1135,13 @@ class GatewayKanbanWatchersMixin:
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
                 if ready_pending and not any_spawned:
-                    bad_ticks += 1
+                    # Saturated is not stuck. Every slot busy looks identical
+                    # to a dispatcher that cannot spawn at all, and only one
+                    # of the two is worth waking someone for.
+                    if await asyncio.to_thread(_workers_live):
+                        bad_ticks = 0
+                    else:
+                        bad_ticks += 1
                 else:
                     bad_ticks = 0
                 if bad_ticks >= HEALTH_WINDOW:

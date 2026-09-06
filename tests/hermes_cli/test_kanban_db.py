@@ -4372,3 +4372,41 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_has_live_workers_false_on_an_idle_board(kanban_home):
+    """No running task means no live worker, whatever else is queued."""
+    with kb.connect() as conn:
+        kb.create_task(conn, title="waiting", assignee="daily")
+        assert kb.has_live_workers(conn) is False
+
+
+def test_has_live_workers_true_while_a_claim_is_alive(kanban_home):
+    """A running task on an unexpired claim is what "saturated, not stuck"
+    looks like: ready work waits, nothing spawns, and nothing is wrong."""
+    import time as _time
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="running", assignee="daily")
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock='host:1', "
+            "claim_expires=? WHERE id=?",
+            (int(_time.time()) + 600, t),
+        )
+        conn.commit()
+        assert kb.has_live_workers(conn) is True
+
+
+def test_has_live_workers_false_when_the_claim_has_expired(kanban_home):
+    """A claim past its expiry is a dead worker the reclaimer has not
+    caught yet. A queue held behind one is still stuck, and the warning
+    this feeds must keep firing."""
+    import time as _time
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="abandoned", assignee="daily")
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock='host:1', "
+            "claim_expires=? WHERE id=?",
+            (int(_time.time()) - 600, t),
+        )
+        conn.commit()
+        assert kb.has_live_workers(conn) is False

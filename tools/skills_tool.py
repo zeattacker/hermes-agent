@@ -1135,11 +1135,21 @@ def skill_view(
         _outside_skills_dir = True
         _trusted_dirs = [SKILLS_DIR.resolve()]
         try:
-            _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
+            # Every configured dir, not ``all_dirs[1:]``: that slice assumed
+            # SKILLS_DIR is always element 0, and it is only there when it
+            # exists. On a profile with no local skills dir the slice dropped
+            # the first external_dirs entry, so a dir the operator had
+            # explicitly trusted warned anyway.
+            _trusted_dirs.extend(d.resolve() for d in all_dirs)
         except Exception:
             pass
         for _td in _trusted_dirs:
             try:
+                # Both the path we were given and where it really points. A
+                # skill kept in a project and symlinked into the profile —
+                # the shape every Zexus skill uses — resolves outside the
+                # profile, and only the target tells you whether the operator
+                # trusted that project via ``skills.external_dirs``.
                 skill_md.resolve().relative_to(_td)
                 _outside_skills_dir = False
                 break

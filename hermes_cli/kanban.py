@@ -2278,7 +2278,13 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
         spawned_any = bool(res.spawned)
         if ready_pending and not spawned_any:
-            health_state["bad_ticks"] += 1
+            # Saturated is not stuck: every slot busy looks identical to a
+            # dispatcher that cannot spawn at all. Only one is worth a
+            # warning. See `kanban_db.has_live_workers`.
+            if _workers_live():
+                health_state["bad_ticks"] = 0
+            else:
+                health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
         # Emit a warning once per HEALTH_WINDOW bad ticks (not every tick)
@@ -2313,6 +2319,17 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 f"auto_blocked={len(res.auto_blocked)}",
                 flush=True,
             )
+
+    def _workers_live() -> bool:
+        """Is a worker running right now on a claim that has not expired?
+
+        This is what separates a full dispatcher from a broken one.
+        """
+        try:
+            with kb.connect_closing() as conn:
+                return kb.has_live_workers(conn)
+        except Exception:
+            return False
 
     def _ready_queue_nonempty() -> bool:
         """Cheap probe — is there at least one ready+assigned+unclaimed
